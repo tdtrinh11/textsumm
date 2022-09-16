@@ -228,7 +228,7 @@ BART_INPUTS_DOCSTRING = r"""
     BART_START_DOCSTRING,
 )
 class TAASModel(BartPretrainedModel):
-    def __init__(self, config: BartConfig):
+    def __init__(self, config: BartConfig, topic_num=1024, t_vocab_size=2000):
         super().__init__(config)
 
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
@@ -236,6 +236,17 @@ class TAASModel(BartPretrainedModel):
         # we use BartEncoder and BartDecoder
         self.encoder = BartEncoder(config, self.shared)
         self.decoder = BartDecoder(config, self.shared)
+
+        # initial topic model
+        self.topic_num = topic_num
+        # todo: confirm the vocab_size for topic modeling
+        self.topic_model = DecoderNetwork(vocab_size=t_vocab_size, bert_size=config.d_model,
+                                          infnet="combined", num_topics=self.topic_num, model_type='prodLDA',
+                                          hidden_sizes=(100, 100), activation='relu',
+                                          dropout=self.config.dropout, learn_priors=True)
+        # transfer the topic modeling vocab to vocab size
+        self.tm_head = nn.Linear(t_vocab_size, config.d_model, bias=False)
+        self.lm_head = nn.Linear(config.d_model, topic_num, bias=False)
 
         self.init_weights()
 
@@ -274,6 +285,8 @@ class TAASModel(BartPretrainedModel):
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
+            topic_guided=True,
+            bow=None
     ):
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -308,11 +321,32 @@ class TAASModel(BartPretrainedModel):
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
 
+        # topic modeling
+        # topic attention
+        bow = bow.reshape(bow.shape[0], -1)
+
+        # perform topic modeling - use "[CLS]" as the representation
+        prior_mean, prior_variance, posterior_mean, posterior_variance, posterior_log_variance, word_dists, h = self.topic_model( bow, encoder_outputs.last_hidden_state[::, 0])
+
+        if topic_guided:
+            # convert encoder_outputs[0] 
+            _encoder_hidden_states = encoder_outputs[0] + torch.matmul(self.lm_head(encoder_outputs[0]), self.tm_head(self.topic_model.topic_word))
+            # _encoder_hidden_states = encoder_outputs[0] + torch.matmul(encoder_outputs[0], self.tm_head_2(torch.unsqueeze(self.tm_head(h), dim=-1)))
+        else:
+            _encoder_hidden_states = encoder_outputs[0]
+
+        # loss for topic modeling
+        if bow.size()[0] < word_dists.size()[0]:
+            self.loss_topic_modeling = 0
+        else:
+            self.loss_topic_modeling = topic_modeling_loss(bow, self.topic_num, word_dists, prior_mean, prior_variance,
+                                                      posterior_mean, posterior_variance, posterior_log_variance)
+
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_outputs[0],
+            encoder_hidden_states=_encoder_hidden_states,
             encoder_attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=decoder_inputs_embeds,
@@ -349,21 +383,21 @@ class TAASForConditionalGeneration(BartPretrainedModel):
         r"lm_head\.weight",
     ]
 
-    def __init__(self, config: BartConfig, topic_num=1024, vocab_size=2000):
+    def __init__(self, config: BartConfig, topic_num=1024, t_vocab_size=2000):
         super().__init__(config)
-        self.model = TAASModel(config)
+        self.model = TAASModel(config, topic_num=topic_num, t_vocab_size=t_vocab_size)
         self.register_buffer("final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings)))
         self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
 
         # initial topic model
-        self.topic_num = topic_num
-        # todo: confirm the vocab_size for topic modeling
-        self.topic_model = DecoderNetwork(vocab_size=vocab_size, bert_size=config.d_model,
-                                          infnet="zeroshot", num_topics=self.topic_num, model_type='prodLDA',
-                                          hidden_sizes=(100, 100), activation='softplus',
-                                          dropout=self.config.dropout, learn_priors=True)
+        # self.topic_num = topic_num
+        # # todo: confirm the vocab_size for topic modeling
+        # self.topic_model = DecoderNetwork(vocab_size=vocab_size, bert_size=config.d_model,
+        #                                   infnet="zeroshot", num_topics=self.topic_num, model_type='prodLDA',
+        #                                   hidden_sizes=(100, 100), activation='softplus',
+        #                                   dropout=self.config.dropout, learn_priors=True)
         # transfer the topic modeling vocab to vocab size
-        self.tm_head = nn.Linear(vocab_size, self.model.shared.num_embeddings, bias=False)
+        # self.tm_head = nn.Linear(vocab_size, self.model.shared.num_embeddings, bias=False)
         # for model analysis: use an additional NN to transfer dimension
         # self.dimhead = nn.Linear(config.d_model, self.topic_num, bias=False)
 
@@ -413,7 +447,6 @@ class TAASForConditionalGeneration(BartPretrainedModel):
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
-            topic_guided=True,
             bow=None,
     ):
         r"""
@@ -445,14 +478,15 @@ class TAASForConditionalGeneration(BartPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            bow=bow
         )
 
         # topic attention
-        bow = bow.reshape(bow.shape[0], -1)
+        # bow = bow.reshape(bow.shape[0], -1)
 
         # perform topic modeling - use "[CLS]" as the representation
-        prior_mean, prior_variance, posterior_mean, posterior_variance, posterior_log_variance, word_dists, h = self.topic_model(
-            bow, outputs.encoder_last_hidden_state[::, 0])
+        # prior_mean, prior_variance, posterior_mean, posterior_variance, posterior_log_variance, word_dists, h = self.topic_model(
+        #     bow, outputs.encoder_last_hidden_state[::, 0])
 
         # outputs[0]: if the last hidden state from the decoder_outputs; size: torch.Size([bs, #(summary), d_model])
         # self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
@@ -461,13 +495,15 @@ class TAASForConditionalGeneration(BartPretrainedModel):
         # lm_logits.size(): torch.Size([16, 38, 50264]) => batch size * #(summary) * len(vocab)
         # theta = self.topic_model.get_theta(bow, outputs.encoder_last_hidden_state[::, 0])
 
-        if topic_guided:
-            #     lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias + torch.matmul(self.dimhead(outputs[0]), self.tm_head(
-            #         self.topic_model.topic_word))
-            lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias + torch.matmul(outputs[0], self.tm_head(
-                self.topic_model.topic_word))
-        else:
-            lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
+        # if topic_guided:
+        #     #     lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias + torch.matmul(self.dimhead(outputs[0]), self.tm_head(
+        #     #         self.topic_model.topic_word))
+        #     lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias + torch.matmul(outputs[0], self.tm_head(
+        #         self.topic_model.topic_word))
+        # else:
+        #     lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
+
+        lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
 
         masked_lm_loss = None
         if labels is not None:
@@ -479,11 +515,11 @@ class TAASForConditionalGeneration(BartPretrainedModel):
             return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
 
         # loss for topic modeling
-        if bow.size()[0] < word_dists.size()[0]:
-            loss_topic_modeling = 0
-        else:
-            loss_topic_modeling = topic_modeling_loss(bow, self.topic_num, word_dists, prior_mean, prior_variance,
-                                                      posterior_mean, posterior_variance, posterior_log_variance)
+        # if bow.size()[0] < word_dists.size()[0]:
+        #     loss_topic_modeling = 0
+        # else:
+        #     loss_topic_modeling = topic_modeling_loss(bow, self.topic_num, word_dists, prior_mean, prior_variance,
+        #                                               posterior_mean, posterior_variance, posterior_log_variance)
 
         return Seq2SeqLMOutput(
             loss=masked_lm_loss,
