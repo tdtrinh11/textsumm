@@ -531,7 +531,7 @@ class TAASForConditionalGeneration(BartPretrainedModel):
             encoder_last_hidden_state=outputs.encoder_last_hidden_state,
             encoder_hidden_states=outputs.encoder_hidden_states,
             encoder_attentions=outputs.encoder_attentions,
-        ), loss_topic_modeling, self.topic_model.topic_word
+        ), self.model.loss_topic_modeling, self.model.topic_model.topic_word
 
     def prepare_inputs_for_generation(self, decoder_input_ids, past=None, attention_mask=None, use_cache=None,
                                       encoder_outputs=None, **kwargs):
